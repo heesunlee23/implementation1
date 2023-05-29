@@ -5,3 +5,6 @@
 
 # misc
 .env
+
+# asset
+/asset
