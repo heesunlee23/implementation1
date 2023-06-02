@@ -1,23 +1,45 @@
-// 사전에 영상을 s3에 업로드한다. (이 부분은 다른 컴포넌트에서 해야 함)
-// 영상을 s3 가져온다. (지금은 일단 로컬에서 가져온다.)
-// 이 영상의 해시 hashFromOriginalFile을 구한다.
-// 해시 hashFromOriginalFile을 토픽으로 발행한다. 
-// *hashstore.js가 이 토픽을 구독하여 해시 h1을 얻는다. 
-// 시간이 지나 무결성 검사를 하려고 한다. 
-  // s3에서 이 영상을 가져온다. (지금은 일단 로컬에서 가져온다.)
-  // 가져온 이미지를 해싱해 h2를 얻는다. 
-  // hashstore.js에게 해시 h1을 달라고 요구한다
-  // *hashstore.js가 이 토픽을 구독하고 해시 h1을 manager.js로 보낸다. 
-  // h1과 h2를 비교하여 무결성을 검사한다. 
+// 1. 사전에 영상을 AWS s3에 업로드한다. (이 부분은 다른 컴포넌트에서 해야 한다.)
+// 2. 영상 m_1 을 s3로부터 manager.js로 다운로드 받는다. (implementation1 에서는 일단 로컬에서 가져온다.)
+// 3. manager.js에서 m_1의 해시 hashFromOriginalFile을 구한다.
+// 4. manager.js에서 hashFromOriginalFile을 토픽 t_1으로 발행한다. 
+// 5. hashstore.js가 t_1을 구독하여 해시 h1 (hashFromOriginalFile과 내용이 같음) 을 얻는다. 
+// 6. 시간이 지나, 무결성 검사를 하려고 한다. 
+  // 6.1. s3에서 manager.js로 m_1를 다운로드한다. (지금은 일단 로컬에서 가져온다.)
+  // 6.2. manager.js으로 가져온 m_1을 해싱해 h2를 얻는다. 
+  // 6.3. manager.js에서 해시 h1을 요청하는 토픽 t_2를 발행한다.
+  // 6.4. hashstore.js가 토픽 t_2를 구독하고 해시 h1을 토픽 t_3로 발행한다. 
+  // 6.5. manager.js에서 토픽 t_3를 구독하여 h1을 얻는다. 
+  // 6.6. manager.js에서 h1과 h2를 비교하여 무결성을 검사한다. 
 
 const crypto = require('crypto');
-const { Client, TopicCreateTransaction, TopicMessageSubmitTransaction, TopicMessageQuery } = require('@hashgraph/sdk');
+const AWS = require('aws-sdk'),
+      {
+        S3
+      } = require("@aws-sdk/client-s3");
+const { Client, TopicCreateTransaction, TopicMessageSubmitTransaction, TopicMessageQuery, FileId } = require('@hashgraph/sdk');
 require("dotenv").config();
 const fs = require('fs');
 const readline = require('readline');
 
 // Create a variable to store the received messages
 const savedMessages = [];
+
+////////////////////////////////////////////////////////////
+// Configure AWS SDK with your AWS credentials and region
+AWS.config.update({
+  accessKeyId: 'ENTER HERE',
+  secretAccessKey: 'ENTER HERE',
+  region: 'ENTER HERE'
+});
+
+
+// Create an instance of the AWS S3 client
+const s3 = new S3();
+
+// Define the S3 bucket details
+const bucketName = process.env.AWS_S3_BUCKET_NAME;
+const objectKey = process.env.AWS_S3_OBJECT_KEY;
+////////////////////////////////////////////////////////
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,27 +82,10 @@ async function publishTopic(client, data) {
 }
 
 // Function to calculate the hash of a multimedia file
-function calculateHash(filePath) {
-    return new Promise((resolve, reject) => {
-        const hash = crypto.createHash('sha256');
-        const stream = fs.createReadStream(filePath); 
-        // TODO: 여기를 s3 부분으로 바꿔야 함
-        // https://github.com/rosacomputer/programming_practice/blob/main/awsS3HederaCllient.js 여기 보고 할 것 
-        // s3 조작법은 여기 참고 : https://www.youtube.com/watch?v=5S_QHyPA7H4
-
-        stream.on('data', (data) => {
-          hash.update(data);
-        });
-    
-        stream.on('end', () => {
-          const calculatedHash = hash.digest('hex');
-          resolve(calculatedHash);
-        });
-    
-        stream.on('error', (error) => {
-          reject(error);
-        });
-      });
+function calculateHash(fileData) {
+  const hash = crypto.createHash('sha256');
+  hash.update(fileData);
+  return hash.digest('hex');
 }
 
 function handleMessage(message) {
@@ -99,6 +104,18 @@ function subscribeTopic(client, topicId) {
     .subscribe(client, null, handleMessage); 
 }
 
+// Download the file from S3 bucket and store it on Hedera Hashgraph ////////////////////////////
+async function downloadFromS3() {
+  try {
+    const { Body } = await s3.getObject({ Bucket: bucketName, Key: objectKey });
+    return Body;
+  } catch (error) {
+    console.error('Error downloading file from S3:', error);
+    throw error;
+  }
+}
+///////////////////////////////////////////////////////////////////////////////////////////////
+
 async function main() {
   // Initialize Hedera client
   const client = Client.forTestnet();
@@ -106,12 +123,13 @@ async function main() {
   console.log('\nmanager.js: Connected to Testnet!');
   console.log('------------------------------------------------------');
 
-  /////////////////////////// 가져온 데이터의 해시 h1을 구한다. ///////////////
-  let filePath = await getUserInput();
-  // 데스크탑 - const filePath = 'C:/Users/cshee/OneDrive/Desktop/BDD100K(local)/bdd100k_videos_test_00/bdd100k/videos/test/cabc30fc-e7726578.mov';
-  // 윈도우 노트북 - const filePath = 'C:/Users/VCC211116/Downloads/bdd100k_videos_test_00/bdd100k/videos/test/cd35ea13-1ecb210c.mov';
+  ////////// Get Data From AWS S3 ///////////////////////////////////////////
+  // Install AWS SDK for JavaScript (aws-sdk)   !!!!!!!!!!!!
+  // Invoke the function to start the download process
+  const fileData = await downloadFromS3();
 
-  const hashFromOriginalFile = await calculateHash(filePath);
+  /////////////////////////// 가져온 데이터의 해시 h1을 구한다. ///////////////
+  const hashFromOriginalFile = await calculateHash(fileData);
   console.log('\nCreated hash h1: ' + hashFromOriginalFile);
   console.log('------------------------------------------------------');
 
@@ -151,7 +169,9 @@ async function main() {
 
   ///////////////////// h2: 가져온 원본 데이터 해싱하여 h2 얻기 /////////////////////
   ///////////////////// 이미 s3업로드 되었다고 생각하고 지금은 s3 대신 로컬에서 가져옴 /////////////////////////////////
-  const h2 = await calculateHash(filePath);
+  const fileData2 = downloadFromS3ToHedera(client); // data를 넣도록
+  
+  const h2 = await calculateHash(fileData2);
   console.log('\nCreated hash h2 created from original file: ' + h2);
   console.log('------------------------------------------------------');
 
